@@ -1,0 +1,5 @@
+__pycache__/
+logs/
+models/
+test_plots/
+*.png
