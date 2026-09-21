@@ -66,7 +66,7 @@ def train_dqn_pathfinding():
 
     # Train the agent
     model.learn(
-        total_timesteps=500000,
+        total_timesteps=500000,  # /10
         callback=[eval_callback, checkpoint_callback],
         log_interval=100,
         progress_bar=True,

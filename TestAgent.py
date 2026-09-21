@@ -54,7 +54,7 @@ def plot_episode(
     fig = plt.figure(figsize=(9, 8))
     ax = fig.add_subplot(projection="3d")
 
-    ax.voxels(env.obstacle_matrix, facecolors=[0, 0, 0, 0.5], edgecolors=[1, 1, 1])
+    ax.voxels(env._obstacle_matrix, facecolors=[0, 0, 0, 0.5], edgecolors=[1, 1, 1])
 
     # Cell-center offset so paths/markers sit inside cells
     agent_path = result["agent_trajectory"] + 0.5
@@ -126,7 +126,7 @@ def animate_episode(
     fig = plt.figure(figsize=(9, 8))
     ax = fig.add_subplot(projection="3d")
 
-    ax.voxels(env.obstacle_matrix, facecolors=[0, 0, 0, 0.5], edgecolors=[1, 1, 1])
+    ax.voxels(env._obstacle_matrix, facecolors=[0, 0, 0, 0.5], edgecolors=[1, 1, 1])
 
     agent_path = result["agent_trajectory"] + 0.5
     obj_center_offset = result["obj_dims"] / 2.0

@@ -9,8 +9,10 @@ from collections import deque
 
 _RANDOM_TRY_TIMEOUT = 100
 _POSITION_HISTORY_LEN = 3
-_OBS_DIMS = 22 + 3 * _POSITION_HISTORY_LEN
+_N_CLOSEST_OBTACLES = 10
+_OBS_DIMS = 18 + 3 * _POSITION_HISTORY_LEN + 4 * _N_CLOSEST_OBTACLES
 _MIN_TARGET_DIST = 10
+_USE_BFS_REWARD = False  # False: Euclidean-distance reward instead of BFS shaping
 
 
 class _ConstructionItem:
@@ -111,12 +113,17 @@ class SimEnv(gym.Env):
                     )
         for obs in obstacles:
             self._check_collision(obs)
-        self.construction_objects: List[ConstructionObject] = construction_objects
-        self.obstacles = obstacles
-        self.obstacle_matrix = np.clip(
+        self._construction_objects: List[ConstructionObject] = construction_objects
+        self._obstacles = obstacles
+        self._obstacle_matrix = np.clip(
             self.place_objects(obstacles), a_min=None, a_max=1
         )
-        combined = self.obstacle_matrix + self.place_objects(self.construction_objects)
+        # precompute obstacle voxel array for later closest obstacle computation
+        self._obstacle_voxels = np.argwhere(self._obstacle_matrix > 0)
+
+        combined = self._obstacle_matrix + self.place_objects(
+            self._construction_objects
+        )
         if np.any(combined > 1):
             raise ValueError("objects/obstacles overlap")
 
@@ -132,10 +139,14 @@ class SimEnv(gym.Env):
         # 0: +x, 1: -x, 2: +y, 3: -y, 4: PICK_UP, 5: DROP
         self.action_space = spaces.Discrete(4)
 
-        # Observation space: 22 base dimensions + 3 per remembered past position
-        max_dist = max(self.matrix.shape)
+        # Observation space: 18 base dimensions + 3 per remembered past position
+        # + 4 per closest-obstacle slot
+        self._max_dist = max(self.matrix.shape)
         self.observation_space = spaces.Box(
-            low=-max_dist, high=max_dist, shape=(_OBS_DIMS,), dtype=np.float32
+            low=-self._max_dist,
+            high=self._max_dist,
+            shape=(_OBS_DIMS,),
+            dtype=np.float32,
         )
 
         self.max_steps = max_steps
@@ -159,7 +170,7 @@ class SimEnv(gym.Env):
         # TODO: implement complex objects
         if np.any(position < 0) or np.any(position == self.matrix.shape):
             return False
-        matrix = self.place_objects(self.construction_objects, self.obstacle_matrix)
+        matrix = self.place_objects(self._construction_objects, self._obstacle_matrix)
         x, y, z = position[0], position[1], position[2]
         return matrix[x, y, z] == 0
 
@@ -176,7 +187,7 @@ class SimEnv(gym.Env):
 
         ax = plt.figure().add_subplot(projection="3d")
         ax.voxels(
-            self.obstacle_matrix,
+            self._obstacle_matrix,
             facecolors=[0, 0, 0],
             edgecolors=[1, 1, 1],
         )
@@ -220,7 +231,7 @@ class SimEnv(gym.Env):
         as a heatmap, obstacles overlaid in black, and markers for the agent,
         object, and target.
         """
-        obj = self.construction_objects[0]
+        obj = self._construction_objects[0]
         dist_field = (
             self._dist_to_object
             if self.phase == self.Phase.TO_OBJECT
@@ -228,7 +239,7 @@ class SimEnv(gym.Env):
         )
         reward_field = -dist_field
 
-        free = self.obstacle_matrix[:, :, 0] == 0
+        free = self._obstacle_matrix[:, :, 0] == 0
         size_x, size_y = free.shape
         # NaN out obstacle cells so they don't get colored by the reward colormap;
         # they're drawn separately below instead.
@@ -308,7 +319,7 @@ class SimEnv(gym.Env):
         """
 
         if objects is None:
-            objects = self.construction_objects
+            objects = self._construction_objects
         if matrix is None:
             matrix = self.matrix.copy()
         else:
@@ -358,7 +369,7 @@ class SimEnv(gym.Env):
         penalty, so a stray episode where BFS can't reach a cell degrades gracefully
         instead of blowing up the reward with inf.
         """
-        free = self.obstacle_matrix[:, :, 0] == 0
+        free = self._obstacle_matrix[:, :, 0] == 0
         size_x, size_y = free.shape
         unreachable = size_x * size_y
         dist = np.full((size_x, size_y), unreachable, dtype=np.float32)
@@ -390,7 +401,7 @@ class SimEnv(gym.Env):
         the object's spawn position or target position changes (construction and
         every reset()).
         """
-        obj = self.construction_objects[0]
+        obj = self._construction_objects[0]
         self._dist_to_object = self._bfs_distance_field((obj.pos[0], obj.pos[1]))
         self._dist_to_target = self._bfs_distance_field(
             (obj.target_pos[0], obj.target_pos[1])
@@ -410,31 +421,50 @@ class SimEnv(gym.Env):
     def _randomise_agent_pos(
         self,
     ) -> None:
-        matrix = self.place_objects(self.construction_objects, self.obstacle_matrix)
+        matrix = self.place_objects(self._construction_objects, self._obstacle_matrix)
         pos = self.find_empty_cell(matrix, [None, None, 0])
         self.agent_pos = np.array((pos), dtype=np.uint8)
 
-    def _get_closest_obstacle_info(self):
+    def _get_closest_obstacle_info(self, agent_pos):
         """
-        Get distance and direction to closest obstacle from agent.
+        Get array of distances and directions to closest obstacles from agent.
         """
-        # TODO: add support for multiple agents
-        if not self.obstacles:
-            return float("inf"), np.zeros(3, dtype=np.float32)
+        # TODO: include objects and other robots in this logic?
+        # calculate vectors and distances to each occupied voxel
+        diffs = self._obstacle_voxels - agent_pos
+        dists = np.linalg.norm(diffs, axis=1)
+        # Handle fewer occupied voxels than _N_CLOSEST_OBSTACLES
+        n_found = min(len(dists), _N_CLOSEST_OBTACLES)
+        if n_found > 0:
+            # find the n_found closest occupied voxels
+            idxs = np.argpartition(dists, n_found - 1)[:n_found]
+            closest_diffs = diffs[idxs]
+            closest_dists = dists[idxs]
 
-        min_dist = float("inf")
-        closest_direction = np.zeros(3, dtype=np.float32)
+            # sort them correctly
+            order = np.argsort(closest_dists)
+            closest_diffs = closest_diffs[order]
+            closest_dists = closest_dists[order]
 
-        for obstacle in self.obstacles:
-            diff = obstacle.pos.astype(np.float32) - self.agent_pos.astype(np.float32)
-            dist = float(np.linalg.norm(diff))
-            if dist < min_dist:
-                min_dist = dist
-                closest_direction = (
-                    diff / dist if dist > 0 else np.zeros(3, dtype=np.float32)
-                )
+            # compute unit directions
+            directions = np.divide(
+                closest_diffs,
+                closest_dists[:, None],
+                out=np.zeros_like(closest_diffs, dtype=np.float64),
+                where=closest_dists[:, None] > 0,
+            )
+            found = np.column_stack([closest_dists, directions]).ravel()
+        else:
+            found = np.empty(0, dtype=np.float32)
 
-        return min_dist, closest_direction
+        # Pad missing slots with max_dist/zero-direction so the output always has a fixed size.
+        n_missing = _N_CLOSEST_OBTACLES - n_found
+        if n_missing > 0:
+            padding = np.zeros((n_missing, 4), dtype=np.float32)
+            padding[:, 0] = self._max_dist
+            found = np.concatenate([found, padding.ravel()])
+
+        return found
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
@@ -442,14 +472,14 @@ class SimEnv(gym.Env):
         super().reset(seed=seed, options=options)
         self.phase = self.Phase.TO_OBJECT
         self.current_step = 0
-        obj = self.construction_objects[0]
+        obj = self._construction_objects[0]
         obj.is_carried = False
         obj.pos = np.array(
-            self.find_empty_cell(self.obstacle_matrix, [None, None, 0]), dtype=np.uint8
+            self.find_empty_cell(self._obstacle_matrix, [None, None, 0]), dtype=np.uint8
         )
         for _ in range(_RANDOM_TRY_TIMEOUT):
             obj.target_pos = np.array(
-                self.find_empty_cell(self.obstacle_matrix, [None, None, 1]),
+                self.find_empty_cell(self._obstacle_matrix, [None, None, 1]),
                 dtype=np.uint8,
             )
             if (
@@ -472,36 +502,35 @@ class SimEnv(gym.Env):
         Get current observation (_OBS_DIMS dimensions).
         """
 
-        agent = self.agent_pos.astype(np.float32)
-        obj = self.construction_objects[0]
+        agent_pos = self.agent_pos.astype(np.float32)
+        obj = self._construction_objects[0]
         obj_pos = obj.pos.astype(np.float32)
         obj_target_pos = obj.target_pos.astype(np.float32)
 
-        dist_agent_to_obj = float(np.linalg.norm(agent - obj_pos))
+        dist_agent_to_obj = float(np.linalg.norm(agent_pos - obj_pos))
         dist_obj_to_target = float(np.linalg.norm(obj_pos - obj_target_pos))
         is_carrying = 1.0 if obj.is_carried else 0.0
 
-        closest_obstacle_dist, closest_obstacle_dir = self._get_closest_obstacle_info()
+        obstacles = self._get_closest_obstacle_info(agent_pos)
 
         # Normalized direction from agent to object target
-        diff_to_obj_target = obj_target_pos - agent
+        diff_to_obj_target = obj_target_pos - agent_pos
         norm = float(np.linalg.norm(diff_to_obj_target))
         dir_to_obj_target = (
             diff_to_obj_target / norm if norm > 0 else np.zeros(3, dtype=np.float32)
         )
-
+        # TODO: fix calculation of distance to object to not use origin
         obs = np.concatenate(
             [
-                agent,  # 0-2
+                agent_pos,  # 0-2
                 obj_pos,  # 3-5
                 obj_target_pos,  # 6-8
                 np.array([dist_agent_to_obj], dtype=np.float32),  # 9
                 np.array([dist_obj_to_target], dtype=np.float32),  # 10
                 np.array([is_carrying], dtype=np.float32),  # 11
-                np.array([closest_obstacle_dist], dtype=np.float32),  # 12
-                closest_obstacle_dir,  # 13-15
-                obj.matrix.shape,  # 16-18
-                dir_to_obj_target,  # 19-21
+                obj.matrix.shape,  # 12-14
+                dir_to_obj_target,  # 15-17
+                obstacles,  # 18-57
             ]
         ).astype(np.float32)
 
@@ -509,7 +538,7 @@ class SimEnv(gym.Env):
         if _POSITION_HISTORY_LEN != 0:
             position_history = np.concatenate(
                 [
-                    agent - hist_pos.astype(np.float32)
+                    agent_pos - hist_pos.astype(np.float32)
                     for hist_pos in self._position_history
                 ]
             )
@@ -525,7 +554,7 @@ class SimEnv(gym.Env):
         """
         Get additional info complementing the observation from _get_obs().
         """
-        obj = self.construction_objects[
+        obj = self._construction_objects[
             0
         ]  # TODO: add support for multiple objects/agents
         return {
@@ -545,8 +574,8 @@ class SimEnv(gym.Env):
                 )
             ),
             "steps": self.current_step,
-            "obstacles": [o.copy() for o in self.obstacles],
-            "num_obstacles": len(self.obstacles),
+            "obstacles": [o.copy() for o in self._obstacles],
+            "num_obstacles": len(self._obstacles),
         }
 
     def step(self, action):
@@ -556,7 +585,7 @@ class SimEnv(gym.Env):
         # TODO: multiple agents/objects
         self.current_step += 1
         old_pos = self.agent_pos.copy()
-        obj = self.construction_objects[0]
+        obj = self._construction_objects[0]
 
         collision = False
         invalid_action = False
@@ -619,23 +648,34 @@ class SimEnv(gym.Env):
         #             self.phase = 0
 
         # auto-pickup object - TEMPORARY TODO: remove this
-        if obj.is_adjacent(self.agent_pos):
+        if obj.is_adjacent(self.agent_pos, 2.1):
             obj.is_carried = True
             self.phase = self.Phase.TO_TARGET
         if obj.is_carried:
             obj.pos = (self.agent_pos + [0, 0, 1]).astype(np.uint8)
 
         # auto-dropoff - TEMPORARY TODO: remove this
-        if obj.is_adjacent(obj.target_pos, 0.9) and obj.is_carried:
+        if obj.is_adjacent(obj.target_pos, 1.9) and obj.is_carried:
             terminated = True
             reward += 100
 
-        # REWARD based on pre-computed BFS distances (only 2D)
-        ax, ay = int(self.agent_pos[0]), int(self.agent_pos[1])
+        # REWARD: BFS-shaped distance (obstacle-aware, only 2D) or plain Euclidean
+        # distance, depending on _USE_BFS_REWARD. The BFS path also gets a small
+        # bump to cells that are directly adjacent rather than diagonally adjacent.
+        agent_x, agent_y = int(self.agent_pos[0]), int(self.agent_pos[1])
         if self.phase == self.Phase.TO_OBJECT:
-            reward -= float(self._dist_to_object[ax, ay])
+            goal_x, goal_y = float(obj.pos[0]), float(obj.pos[1])
+            bfs_dist = float(self._dist_to_object[agent_x, agent_y])
         else:
-            reward -= float(self._dist_to_target[ax, ay])
+            goal_x, goal_y = float(obj.target_pos[0]), float(obj.target_pos[1])
+            bfs_dist = float(self._dist_to_target[agent_x, agent_y])
+        euclidean_dist = float(np.hypot(agent_x - goal_x, agent_y - goal_y))
+
+        if _USE_BFS_REWARD:
+            reward -= bfs_dist
+            reward -= 0.01 * euclidean_dist
+        else:
+            reward -= euclidean_dist
 
         if collision:
             reward -= 10.0
@@ -644,6 +684,15 @@ class SimEnv(gym.Env):
             reward -= 2.0
 
         reward -= 0.1
+
+        # Penalize immediately reversing the last move/wiggling.
+        # only if not collision, otherwise not actually a wiggle
+        if (
+            not collision
+            and len(self._position_history) >= 2
+            and np.array_equal(self.agent_pos, self._position_history[-2])
+        ):
+            reward -= 1.0
 
         truncated = bool(self.current_step >= self.max_steps)
 
@@ -662,29 +711,29 @@ def make_env() -> SimEnv:
     Make an env with a fixed set of obstacles TODO: add support for obstacle randomisation, add scene validation
     """
     const_objs = [
-        ConstructionObject((1, 1, 1), (0, 0, 0), (20, 14, 1)),
+        ConstructionObject((1, 1, 1), (0, 0, 0), (40, 28, 1)),
+    ]
+    obstacles = [
+        EnvObstacle((6, 2, 2), (0, 16, 0)),
+        EnvObstacle((2, 12, 2), (16, 0, 0)),
+        EnvObstacle((2, 12, 2), (26, 17, 0)),
+        EnvObstacle((2, 12, 2), (14, 17, 0)),
     ]
     # obstacles = [
-    #     EnvObstacle((3, 1, 1), (0, 8, 0)),
-    #     EnvObstacle((1, 6, 1), (8, 0, 0)),
-    #     EnvObstacle((1, 6, 1), (13, 6, 0)),
-    #     EnvObstacle((1, 6, 1), (7, 9, 0)),
+    #     EnvObstacle((1, 1, 1), (0, 8, 0)),
+    #     EnvObstacle((1, 1, 1), (8, 0, 0)),
+    #     EnvObstacle((1, 1, 1), (13, 6, 0)),
+    #     EnvObstacle((1, 1, 1), (7, 9, 0)),
+    #     EnvObstacle((1, 1, 1), (2, 2, 0)),
+    #     EnvObstacle((1, 1, 1), (2, 12, 0)),
+    #     EnvObstacle((1, 1, 1), (5, 4, 0)),
+    #     EnvObstacle((1, 1, 1), (5, 13, 0)),
+    #     EnvObstacle((1, 1, 1), (10, 3, 0)),
+    #     EnvObstacle((1, 1, 1), (10, 10, 0)),
+    #     EnvObstacle((1, 1, 1), (15, 2, 0)),
+    #     EnvObstacle((1, 1, 1), (15, 9, 0)),
+    #     EnvObstacle((1, 1, 1), (17, 13, 0)),
+    #     EnvObstacle((1, 1, 1), (3, 6, 0)),
     # ]
-    obstacles = [
-        EnvObstacle((1, 1, 1), (0, 8, 0)),
-        EnvObstacle((1, 1, 1), (8, 0, 0)),
-        EnvObstacle((1, 1, 1), (13, 6, 0)),
-        EnvObstacle((1, 1, 1), (7, 9, 0)),
-        EnvObstacle((1, 1, 1), (2, 2, 0)),
-        EnvObstacle((1, 1, 1), (2, 12, 0)),
-        EnvObstacle((1, 1, 1), (5, 4, 0)),
-        EnvObstacle((1, 1, 1), (5, 13, 0)),
-        EnvObstacle((1, 1, 1), (10, 3, 0)),
-        EnvObstacle((1, 1, 1), (10, 10, 0)),
-        EnvObstacle((1, 1, 1), (15, 2, 0)),
-        EnvObstacle((1, 1, 1), (15, 9, 0)),
-        EnvObstacle((1, 1, 1), (17, 13, 0)),
-        EnvObstacle((1, 1, 1), (3, 6, 0)),
-    ]
 
-    return SimEnv((21, 15, 5), const_objs, obstacles)
+    return SimEnv((41, 29, 5), const_objs, obstacles)
