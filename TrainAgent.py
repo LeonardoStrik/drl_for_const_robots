@@ -2,7 +2,7 @@ import gymnasium as gym
 from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from Env import make_env
+from Env import make_env, make_continuous_env
 import os
 
 
@@ -66,7 +66,7 @@ def train_dqn_pathfinding():
 
     # Train the agent
     model.learn(
-        total_timesteps=500000,  # /10
+        total_timesteps=500000,
         callback=[eval_callback, checkpoint_callback],
         log_interval=100,
         progress_bar=True,
@@ -112,6 +112,18 @@ def train_ppo_pathfinding():
         name_prefix="ppo_pathfinding",
     )
 
+    model = PPO(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        verbose=1,
+        tensorboard_log="./logs/tensorboard/",
+    )
+
     print("Starting training...")
     print(f"Total timesteps: 500,000")
     print(f"Observation space: {env.observation_space}")
@@ -132,7 +144,73 @@ def train_ppo_pathfinding():
     return model
 
 
-_TRAIN_FNS = {"dqn": train_dqn_pathfinding, "ppo": train_ppo_pathfinding}
+def train_ppo_continuous():
+    """
+    Train a PPO agent with continuous [v, omega] actions on ContinuousSimEnv.
+    """
+
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+
+    env = make_continuous_env()
+    env = Monitor(env)
+
+    eval_env = make_continuous_env()
+    eval_env = Monitor(eval_env)
+
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path="./models/best_model_continuous",
+        log_path="./logs/",
+        eval_freq=5000,
+        deterministic=True,
+        render=False,
+        n_eval_episodes=10,
+    )
+
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000,
+        save_path="./models/checkpoints/",
+        name_prefix="ppo_continuous",
+    )
+
+    model = PPO(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        verbose=1,
+        tensorboard_log="./logs/tensorboard/",
+        use_sde=True,
+        policy_kwargs=dict(squash_output=True),
+    )
+
+    print("Starting training...")
+    print(f"Total timesteps: 500,000")
+    print(f"Observation space: {env.observation_space}")
+    print(f"Action space: {env.action_space}")
+
+    model.learn(
+        total_timesteps=500000 * 2,
+        callback=[eval_callback, checkpoint_callback],
+        log_interval=100,
+        progress_bar=True,
+    )
+
+    model.save("models/ppo_continuous_final")
+    print("Training complete! Model saved to 'models/ppo_continuous_final'")
+
+    return model
+
+
+_TRAIN_FNS = {
+    "dqn": train_dqn_pathfinding,
+    "ppo": train_ppo_pathfinding,
+    "ppo_continuous": train_ppo_continuous,
+}
 
 
 if __name__ == "__main__":

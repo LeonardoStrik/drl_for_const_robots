@@ -14,6 +14,12 @@ _OBS_DIMS = 18 + 3 * _POSITION_HISTORY_LEN + 4 * _N_CLOSEST_OBTACLES
 _MIN_TARGET_DIST = 10
 _USE_BFS_REWARD = False  # False: Euclidean-distance reward instead of BFS shaping
 
+# ContinuousSimEnv: non-holonomic [v, omega] control
+_V_MAX = 1.5
+_OMEGA_MAX = np.pi / 3
+_DT = 1.0
+_CONTINUOUS_OBS_DIMS = _OBS_DIMS + 2  # + heading unit vector
+
 
 class _ConstructionItem:
     """
@@ -73,6 +79,31 @@ class EnvObstacle(_ConstructionItem):
         super().__init__(shape, origin)
 
 
+class ConstructionAgent:
+    """
+    Class to represent the agents that operate in the environment.
+    """
+
+    def __init__(
+        self,
+        shape: Tuple[int, int, int],
+        pos: Tuple[int, int, int],
+        heading: Tuple[float, float],
+    ) -> None:
+        self.shape = np.array(
+            shape,
+        )
+        self.pos = np.array(
+            pos,
+        )
+        self.heading = np.array(
+            heading,
+        )
+
+    def copy(self) -> Self:
+        return deepcopy(self)
+
+
 class SimEnv(gym.Env):
     """
     class for the simulation environment, contains a list of objects and obstacles
@@ -86,8 +117,8 @@ class SimEnv(gym.Env):
         self,
         shape: Tuple[int, int, int],
         construction_objects: List[ConstructionObject],
+        agents: List[ConstructionAgent],
         obstacles: Optional[List[EnvObstacle]] = None,
-        agent_pos: Optional[np.ndarray] = None,
         max_steps=200,
     ) -> None:
         super().__init__()
@@ -98,6 +129,10 @@ class SimEnv(gym.Env):
 
         construction_objects = [obj.copy() for obj in construction_objects]
         obstacles = [obs.copy() for obs in obstacles]
+        agents = [ag.copy() for ag in agents]
+
+        # TODO add support for multiple agents
+        self.agent = agents[0]
 
         # Check that all objects and obstacles are within bounds
         for obj in construction_objects:
@@ -128,11 +163,6 @@ class SimEnv(gym.Env):
             raise ValueError("objects/obstacles overlap")
 
         self._recompute_distance_fields()
-
-        if agent_pos is not None:
-            self.agent_pos = agent_pos
-        else:
-            self._randomise_agent_pos()
         self._reset_position_history()
 
         # Action space: 6 actions (no flying!)
@@ -197,9 +227,9 @@ class SimEnv(gym.Env):
             edgecolors=[0, 0, 0],
         )
         temp_matrix = self.matrix.copy()
-        x0, x1 = self.agent_pos[0], self.agent_pos[0] + 1
-        y0, y1 = self.agent_pos[1], self.agent_pos[1] + 1
-        z0, z1 = self.agent_pos[2], self.agent_pos[2] + 1
+        x0, x1 = self.agent.pos[0], self.agent.pos[0] + 1
+        y0, y1 = self.agent.pos[1], self.agent.pos[1] + 1
+        z0, z1 = self.agent.pos[2], self.agent.pos[2] + 1
         temp_matrix[x0:x1, y0:y1, z0:z1] += 1
         ax.voxels(
             temp_matrix,
@@ -264,7 +294,7 @@ class SimEnv(gym.Env):
             extent=(0, size_x, 0, size_y),
         )
 
-        agent_xy = self.agent_pos[:2].astype(np.float32) + 0.5
+        agent_xy = self.agent.pos[:2].astype(np.float32) + 0.5
         obj_xy = obj.pos[:2].astype(np.float32) + 0.5
         target_xy = obj.target_pos[:2].astype(np.float32) + 0.5
 
@@ -327,9 +357,10 @@ class SimEnv(gym.Env):
 
         for obj in objects:
 
-            x0, x1 = obj.pos[0], obj.matrix.shape[0] + obj.pos[0]
-            y0, y1 = obj.pos[1], obj.matrix.shape[1] + obj.pos[1]
-            z0, z1 = obj.pos[2], obj.matrix.shape[2] + obj.pos[2]
+            px, py, pz = int(obj.pos[0]), int(obj.pos[1]), int(obj.pos[2])
+            x0, x1 = px, obj.matrix.shape[0] + px
+            y0, y1 = py, obj.matrix.shape[1] + py
+            z0, z1 = pz, obj.matrix.shape[2] + pz
             matrix[x0:x1, y0:y1, z0:z1] += obj.matrix
         return matrix
 
@@ -414,7 +445,7 @@ class SimEnv(gym.Env):
         history instead of stale data from a previous episode.
         """
         self._position_history = deque(
-            [self.agent_pos.copy() for _ in range(_POSITION_HISTORY_LEN)],
+            [self.agent.pos.copy() for _ in range(_POSITION_HISTORY_LEN)],
             maxlen=_POSITION_HISTORY_LEN,
         )
 
@@ -423,7 +454,7 @@ class SimEnv(gym.Env):
     ) -> None:
         matrix = self.place_objects(self._construction_objects, self._obstacle_matrix)
         pos = self.find_empty_cell(matrix, [None, None, 0])
-        self.agent_pos = np.array((pos), dtype=np.uint8)
+        self.agent.pos = np.array((pos), dtype=np.uint8)
 
     def _get_closest_obstacle_info(self, agent_pos):
         """
@@ -502,7 +533,7 @@ class SimEnv(gym.Env):
         Get current observation (_OBS_DIMS dimensions).
         """
 
-        agent_pos = self.agent_pos.astype(np.float32)
+        agent_pos = self.agent.pos.astype(np.float32)
         obj = self._construction_objects[0]
         obj_pos = obj.pos.astype(np.float32)
         obj_target_pos = obj.target_pos.astype(np.float32)
@@ -558,14 +589,14 @@ class SimEnv(gym.Env):
             0
         ]  # TODO: add support for multiple objects/agents
         return {
-            "agent_position": self.agent_pos.copy(),
+            "agent_position": self.agent.pos.copy(),
             "object_position": obj.pos.copy(),
             "object_target_position": obj.target_pos.copy(),
             "object_dimensions": deepcopy(obj.matrix.shape),
             "is_carrying": obj.is_carried,
             "dist_agent_to_object": float(
                 np.linalg.norm(
-                    self.agent_pos.astype(np.float32) - obj.pos.astype(np.float32)
+                    self.agent.pos.astype(np.float32) - obj.pos.astype(np.float32)
                 )
             ),
             "dist_object_to_target": float(
@@ -584,7 +615,7 @@ class SimEnv(gym.Env):
         """
         # TODO: multiple agents/objects
         self.current_step += 1
-        old_pos = self.agent_pos.copy()
+        old_pos = self.agent.pos.copy()
         obj = self._construction_objects[0]
 
         collision = False
@@ -603,15 +634,15 @@ class SimEnv(gym.Env):
                 movement[1] = 1
             elif action == 3:
                 movement[1] = -1
-            new_pos = np.clip(self.agent_pos + movement, 0, self.matrix.shape).astype(
+            new_pos = np.clip(self.agent.pos + movement, 0, self.matrix.shape).astype(
                 np.uint8
             )
 
             if not self._is_position_valid(new_pos):
                 collision = True
-                self.agent_pos = old_pos
+                self.agent.pos = old_pos
             else:
-                self.agent_pos = new_pos
+                self.agent.pos = new_pos
 
         self._position_history.append(old_pos)
 
@@ -648,11 +679,11 @@ class SimEnv(gym.Env):
         #             self.phase = 0
 
         # auto-pickup object - TEMPORARY TODO: remove this
-        if obj.is_adjacent(self.agent_pos, 2.1):
+        if obj.is_adjacent(self.agent.pos, 2.1):
             obj.is_carried = True
             self.phase = self.Phase.TO_TARGET
         if obj.is_carried:
-            obj.pos = (self.agent_pos + [0, 0, 1]).astype(np.uint8)
+            obj.pos = (self.agent.pos + [0, 0, 1]).astype(np.uint8)
 
         # auto-dropoff - TEMPORARY TODO: remove this
         if obj.is_adjacent(obj.target_pos, 1.9) and obj.is_carried:
@@ -662,7 +693,7 @@ class SimEnv(gym.Env):
         # REWARD: BFS-shaped distance (obstacle-aware, only 2D) or plain Euclidean
         # distance, depending on _USE_BFS_REWARD. The BFS path also gets a small
         # bump to cells that are directly adjacent rather than diagonally adjacent.
-        agent_x, agent_y = int(self.agent_pos[0]), int(self.agent_pos[1])
+        agent_x, agent_y = int(self.agent.pos[0]), int(self.agent.pos[1])
         if self.phase == self.Phase.TO_OBJECT:
             goal_x, goal_y = float(obj.pos[0]), float(obj.pos[1])
             bfs_dist = float(self._dist_to_object[agent_x, agent_y])
@@ -690,7 +721,7 @@ class SimEnv(gym.Env):
         if (
             not collision
             and len(self._position_history) >= 2
-            and np.array_equal(self.agent_pos, self._position_history[-2])
+            and np.array_equal(self.agent.pos, self._position_history[-2])
         ):
             reward -= 1.0
 
@@ -700,6 +731,141 @@ class SimEnv(gym.Env):
         info = self._get_info()
         info["collision"] = collision
         info["invalid_action"] = invalid_action
+        info["phase"] = self.phase
+        info["is_carrying"] = obj.is_carried
+
+        return observation, float(reward), terminated, truncated, info
+
+
+class ContinuousSimEnv(SimEnv):
+    """
+    Non-holonomic variant of SimEnv: continuous position and heading (unit
+    vector), controlled via [v, omega] actions.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.action_space = spaces.Box(
+            low=np.array([-_V_MAX, -_OMEGA_MAX], dtype=np.float32),
+            high=np.array([_V_MAX, _OMEGA_MAX], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.observation_space = spaces.Box(
+            low=-self._max_dist,
+            high=self._max_dist,
+            shape=(_CONTINUOUS_OBS_DIMS,),
+            dtype=np.float32,
+        )
+
+    def _randomise_agent_pos(self) -> None:
+        matrix = self.place_objects(self._construction_objects, self._obstacle_matrix)
+        cell = self.find_empty_cell(matrix, [None, None, 0])
+        self.agent.pos = np.array([cell[0] + 0.5, cell[1] + 0.5, 0.0], dtype=np.float32)
+        angle = self.np_random.uniform(-np.pi, np.pi)
+        self.agent.heading = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+
+    def _is_path_clear(self, start: np.ndarray, end: np.ndarray) -> bool:
+        """Samples the segment start->end to catch obstacles a single-point check would skip over."""
+        matrix = self.place_objects(self._construction_objects, self._obstacle_matrix)
+        distance = float(np.hypot(end[0] - start[0], end[1] - start[1]))
+        n_substeps = max(1, int(np.ceil(distance / 0.5)))
+        for i in range(1, n_substeps + 1):
+            t = i / n_substeps
+            x = start[0] + t * (end[0] - start[0])
+            y = start[1] + t * (end[1] - start[1])
+            if x < 0 or y < 0 or x >= matrix.shape[0] or y >= matrix.shape[1]:
+                return False
+            if matrix[int(x), int(y), 0] != 0:
+                return False
+        return True
+
+    def _interpolate_field(self, field: np.ndarray, x: float, y: float) -> float:
+        """Bilinear interpolation, so the BFS field has a gradient between cell centers."""
+        size_x, size_y = field.shape
+        x = float(np.clip(x, 0, size_x - 1))
+        y = float(np.clip(y, 0, size_y - 1))
+        x0, y0 = int(x), int(y)
+        x1, y1 = min(x0 + 1, size_x - 1), min(y0 + 1, size_y - 1)
+        fx, fy = x - x0, y - y0
+        return float(
+            field[x0, y0] * (1 - fx) * (1 - fy)
+            + field[x1, y0] * fx * (1 - fy)
+            + field[x0, y1] * (1 - fx) * fy
+            + field[x1, y1] * fx * fy
+        )
+
+    def _get_obs(self):
+        return np.concatenate([super()._get_obs(), self.agent.heading.astype(np.float32)])
+
+    def _get_info(self):
+        info = super()._get_info()
+        info["agent_heading"] = self.agent.heading.copy()
+        return info
+
+    def step(self, action):
+        self.current_step += 1
+        old_pos = self.agent.pos.copy()
+        obj = self._construction_objects[0]
+        reward = 0.0
+        terminated = False
+
+        v = float(np.clip(action[0], -_V_MAX, _V_MAX))
+        omega = float(np.clip(action[1], -_OMEGA_MAX, _OMEGA_MAX))
+
+        # rotate heading, then move along the updated heading
+        cos_o, sin_o = np.cos(omega * _DT), np.sin(omega * _DT)
+        hx, hy = float(self.agent.heading[0]), float(self.agent.heading[1])
+        heading = np.array(
+            [cos_o * hx - sin_o * hy, sin_o * hx + cos_o * hy], dtype=np.float32
+        )
+        self.agent.heading = heading / np.linalg.norm(heading)
+
+        new_pos = old_pos.copy()
+        new_pos[0] = np.clip(
+            old_pos[0] + v * _DT * self.agent.heading[0], 0, self.matrix.shape[0] - 1e-3
+        )
+        new_pos[1] = np.clip(
+            old_pos[1] + v * _DT * self.agent.heading[1], 0, self.matrix.shape[1] - 1e-3
+        )
+
+        collision = not self._is_path_clear(old_pos, new_pos)
+        self.agent.pos = old_pos if collision else new_pos
+        self._position_history.append(old_pos)
+
+        # auto-pickup / auto-dropoff - TEMPORARY TODO: remove this
+        if obj.is_adjacent(self.agent.pos, 2.1):
+            obj.is_carried = True
+            self.phase = self.Phase.TO_TARGET
+        if obj.is_carried:
+            obj.pos = self.agent.pos + np.array([0, 0, 1], dtype=np.float32)  # type: ignore[assignment]
+        if obj.is_adjacent(obj.target_pos, 1.9) and obj.is_carried:
+            terminated = True
+            reward += 100
+
+        agent_x, agent_y = float(self.agent.pos[0]), float(self.agent.pos[1])
+        if self.phase == self.Phase.TO_OBJECT:
+            goal_x, goal_y = float(obj.pos[0]), float(obj.pos[1])
+            bfs_dist = self._interpolate_field(self._dist_to_object, agent_x, agent_y)
+        else:
+            goal_x, goal_y = float(obj.target_pos[0]), float(obj.target_pos[1])
+            bfs_dist = self._interpolate_field(self._dist_to_target, agent_x, agent_y)
+        euclidean_dist = float(np.hypot(agent_x - goal_x, agent_y - goal_y))
+
+        if _USE_BFS_REWARD:
+            reward -= bfs_dist
+            reward -= 0.01 * euclidean_dist
+        else:
+            reward -= euclidean_dist
+
+        if collision:
+            reward -= 10.0
+        reward -= 0.1
+
+        truncated = bool(self.current_step >= self.max_steps)
+
+        observation = self._get_obs()
+        info = self._get_info()
+        info["collision"] = collision
         info["phase"] = self.phase
         info["is_carrying"] = obj.is_carried
 
@@ -736,4 +902,20 @@ def make_env() -> SimEnv:
     #     EnvObstacle((1, 1, 1), (3, 6, 0)),
     # ]
 
-    return SimEnv((41, 29, 5), const_objs, obstacles)
+    agents = [ConstructionAgent((1, 1, 1), (0, 0, 0), (1, 0))]
+    return SimEnv((41, 29, 5), const_objs, agents, obstacles)
+
+
+def make_continuous_env() -> ContinuousSimEnv:
+    """Same scene as make_env(), using the non-holonomic continuous agent."""
+    const_objs = [
+        ConstructionObject((1, 1, 1), (0, 0, 0), (40, 28, 1)),
+    ]
+    obstacles = [
+        EnvObstacle((6, 2, 2), (0, 16, 0)),
+        EnvObstacle((2, 12, 2), (16, 0, 0)),
+        EnvObstacle((2, 12, 2), (26, 17, 0)),
+        EnvObstacle((2, 12, 2), (14, 17, 0)),
+    ]
+    agents = [ConstructionAgent((1, 1, 1), (0, 0, 0), (1.0, 0.0))]
+    return ContinuousSimEnv((41, 29, 5), const_objs, agents, obstacles)

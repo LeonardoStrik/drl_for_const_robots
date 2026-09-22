@@ -7,13 +7,15 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 from stable_baselines3 import DQN, PPO
 
-from Env import SimEnv, make_env
+from Env import SimEnv, make_env, make_continuous_env
 
-_ALGOS = {"dqn": DQN, "ppo": PPO}
+_ALGOS = {"dqn": DQN, "ppo": PPO, "ppo_continuous": PPO}
 _DEFAULT_MODEL_PATHS = {
     "dqn": "models/dqn_pathfinding_final",
     "ppo": "models/ppo_pathfinding_final",
+    "ppo_continuous": "models/ppo_continuous_final",
 }
+_ENV_FNS = {"dqn": make_env, "ppo": make_env, "ppo_continuous": make_continuous_env}
 
 
 def run_episode(env: SimEnv, model, seed=None, deterministic: bool = True) -> dict:
@@ -50,14 +52,16 @@ def plot_episode(
     result: dict,
     title: Optional[str] = None,
     save_path: Optional[str] = None,
+    continuous: bool = False,
 ):
     fig = plt.figure(figsize=(9, 8))
     ax = fig.add_subplot(projection="3d")
 
     ax.voxels(env._obstacle_matrix, facecolors=[0, 0, 0, 0.5], edgecolors=[1, 1, 1])
 
-    # Cell-center offset so paths/markers sit inside cells
-    agent_path = result["agent_trajectory"] + 0.5
+    # ContinuousSimEnv positions are already cell-centered; the discrete env's
+    # integer grid positions still need the +0.5 offset to sit inside a cell.
+    agent_path = result["agent_trajectory"] if continuous else result["agent_trajectory"] + 0.5
     ax.plot3D(
         agent_path[:, 0],
         agent_path[:, 1],
@@ -122,13 +126,14 @@ def animate_episode(
     fps: int = 10,
     dpi: int = 150,
     title: Optional[str] = None,
+    continuous: bool = False,
 ):
     fig = plt.figure(figsize=(9, 8))
     ax = fig.add_subplot(projection="3d")
 
     ax.voxels(env._obstacle_matrix, facecolors=[0, 0, 0, 0.5], edgecolors=[1, 1, 1])
 
-    agent_path = result["agent_trajectory"] + 0.5
+    agent_path = result["agent_trajectory"] if continuous else result["agent_trajectory"] + 0.5
     obj_center_offset = result["obj_dims"] / 2.0
     object_path = result["object_trajectory"] + obj_center_offset
     obj_target = result["obj_target"] + obj_center_offset
@@ -209,9 +214,11 @@ def test_and_visualize(
     os.makedirs(out_dir, exist_ok=True)
     model_cls = _ALGOS[algo]
     model = model_cls.load(model_path)
+    make_test_env = _ENV_FNS[algo]
+    continuous = algo == "ppo_continuous"
 
     for ep in range(num_episodes):
-        env = make_env()
+        env = make_test_env()
         ep_seed = None if seed is None else seed + ep
         result = run_episode(env, model, seed=ep_seed)
 
@@ -226,11 +233,13 @@ def test_and_visualize(
             f"steps={result['steps']} | delivered={result['terminated']}"
         )
         save_path = os.path.join(out_dir, f"episode_{ep + 1}.png")
-        plot_episode(env, result, title=title, save_path=save_path)
+        plot_episode(env, result, title=title, save_path=save_path, continuous=continuous)
 
         if animate:
             video_path = os.path.join(out_dir, f"episode_{ep + 1}.mp4")
-            animate_episode(env, result, video_path, fps=fps, title=title)
+            animate_episode(
+                env, result, video_path, fps=fps, title=title, continuous=continuous
+            )
 
         env.close()
 
