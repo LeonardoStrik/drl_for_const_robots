@@ -5,20 +5,42 @@ from typing import Optional
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
-from stable_baselines3 import DQN, PPO
+from stable_baselines3 import DQN, PPO, SAC
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from Env import SimEnv, make_env, make_continuous_env
 
-_ALGOS = {"dqn": DQN, "ppo": PPO, "ppo_continuous": PPO}
+_CONTINUOUS_ALGOS = {"ppo_continuous", "sac_continuous"}
+_ALGOS = {"dqn": DQN, "ppo": PPO, "ppo_continuous": PPO, "sac_continuous": SAC}
 _DEFAULT_MODEL_PATHS = {
     "dqn": "models/dqn_pathfinding_final",
     "ppo": "models/ppo_pathfinding_final",
     "ppo_continuous": "models/ppo_continuous_final",
+    "sac_continuous": "models/sac_continuous_final",
 }
-_ENV_FNS = {"dqn": make_env, "ppo": make_env, "ppo_continuous": make_continuous_env}
+_ENV_FNS = {
+    "dqn": make_env,
+    "ppo": make_env,
+    "ppo_continuous": make_continuous_env,
+    "sac_continuous": make_continuous_env,
+}
+_VECNORM_PATHS = {
+    "ppo_continuous": "models/ppo_continuous_vecnormalize.pkl",
+    "sac_continuous": "models/sac_continuous_vecnormalize.pkl",
+}
 
 
-def run_episode(env: SimEnv, model, seed=None, deterministic: bool = True) -> dict:
+def load_vecnormalize(stats_path: str, env_fn) -> VecNormalize:
+    """Load saved VecNormalize running stats for normalizing obs at predict time."""
+    dummy = DummyVecEnv([env_fn])
+    vecnorm = VecNormalize.load(stats_path, dummy)
+    vecnorm.training = False
+    return vecnorm
+
+
+def run_episode(
+    env: SimEnv, model, seed=None, deterministic: bool = True, vecnorm: Optional[VecNormalize] = None
+) -> dict:
     obs, info = env.reset(seed=seed)
 
     agent_trajectory = [info["agent_position"].copy()]
@@ -29,7 +51,8 @@ def run_episode(env: SimEnv, model, seed=None, deterministic: bool = True) -> di
     total_reward = 0.0
     terminated = truncated = False
     while not (terminated or truncated):
-        action, _ = model.predict(obs, deterministic=deterministic)
+        model_obs = vecnorm.normalize_obs(obs) if vecnorm is not None else obs
+        action, _ = model.predict(model_obs, deterministic=deterministic)
         obs, reward, terminated, truncated, info = env.step(action)
         agent_trajectory.append(info["agent_position"].copy())
         object_trajectory.append(info["object_position"].copy())
@@ -215,12 +238,18 @@ def test_and_visualize(
     model_cls = _ALGOS[algo]
     model = model_cls.load(model_path)
     make_test_env = _ENV_FNS[algo]
-    continuous = algo == "ppo_continuous"
+    continuous = algo in _CONTINUOUS_ALGOS
+
+    vecnorm = None
+    if continuous:
+        vecnorm_path = _VECNORM_PATHS[algo]
+        if os.path.exists(vecnorm_path):
+            vecnorm = load_vecnormalize(vecnorm_path, make_test_env)
 
     for ep in range(num_episodes):
         env = make_test_env()
         ep_seed = None if seed is None else seed + ep
-        result = run_episode(env, model, seed=ep_seed)
+        result = run_episode(env, model, seed=ep_seed, vecnorm=vecnorm)
 
         print(
             f"Episode {ep + 1}: steps={result['steps']} "

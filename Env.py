@@ -12,7 +12,7 @@ _POSITION_HISTORY_LEN = 3
 _N_CLOSEST_OBTACLES = 10
 _OBS_DIMS = 18 + 3 * _POSITION_HISTORY_LEN + 4 * _N_CLOSEST_OBTACLES
 _MIN_TARGET_DIST = 10
-_USE_BFS_REWARD = False  # False: Euclidean-distance reward instead of BFS shaping
+_USE_BFS_REWARD = True  # False: Euclidean-distance reward instead of BFS shaping
 
 # ContinuousSimEnv: non-holonomic [v, omega] control
 _V_MAX = 1.5
@@ -51,20 +51,23 @@ class ConstructionObject(_ConstructionItem):
         self.target_pos = np.array(target_pos, dtype=np.uint8)
         self.is_carried = False
 
+    @property
+    def center(self) -> np.ndarray:
+        """Centroid of the object's bounding box (pos is the box's origin corner)."""
+        return self.pos.astype(np.float32) + np.asarray(
+            self.matrix.shape, dtype=np.float32
+        ) / 2.0
+
     def is_at_target(self, threshold=1.0) -> bool:
         """Check if object center is within threshold of its target."""
         dist = float(
-            np.linalg.norm(
-                self.pos.astype(np.float32) - self.target_pos.astype(np.float32)
-            )
+            np.linalg.norm(self.center - self.target_pos.astype(np.float32))
         )
         return dist < threshold
 
     def is_adjacent(self, pos, pickup_range=1.0) -> bool:
         """Check if agent is close enough to pick up the object."""
-        dist = float(
-            np.linalg.norm(pos.astype(np.float32) - self.pos.astype(np.float32))
-        )
+        dist = float(np.linalg.norm(pos.astype(np.float32) - self.center))
         return dist <= pickup_range
 
 
@@ -165,8 +168,8 @@ class SimEnv(gym.Env):
         self._recompute_distance_fields()
         self._reset_position_history()
 
-        # Action space: 6 actions (no flying!)
-        # 0: +x, 1: -x, 2: +y, 3: -y, 4: PICK_UP, 5: DROP
+        # Action space: 4 actions (no flying!) - 0: +x, 1: -x, 2: +y, 3: -y.
+        # Pickup/dropoff are automatic (proximity-triggered), not actions.
         self.action_space = spaces.Discrete(4)
 
         # Observation space: 18 base dimensions + 3 per remembered past position
@@ -196,13 +199,23 @@ class SimEnv(gym.Env):
                     f"Object {obj} out of bounds on axis {axis}: [{lo}, {hi}) vs {self.matrix.shape[axis]}"
                 )
 
+    def _is_cell_blocked(self, x: int, y: int, z: int) -> bool:
+        """Whether (x, y, z) is occupied by an obstacle or a construction object."""
+        if self._obstacle_matrix[x, y, z] != 0:
+            return True
+        for obj in self._construction_objects:
+            ox, oy, oz = int(obj.pos[0]), int(obj.pos[1]), int(obj.pos[2])
+            sx, sy, sz = obj.matrix.shape
+            if ox <= x < ox + sx and oy <= y < oy + sy and oz <= z < oz + sz:
+                return True
+        return False
+
     def _is_position_valid(self, position):
         # TODO: implement complex objects
         if np.any(position < 0) or np.any(position == self.matrix.shape):
             return False
-        matrix = self.place_objects(self._construction_objects, self._obstacle_matrix)
-        x, y, z = position[0], position[1], position[2]
-        return matrix[x, y, z] == 0
+        x, y, z = int(position[0]), int(position[1]), int(position[2])
+        return not self._is_cell_blocked(x, y, z)
 
     def render(self, top_down: bool = False):
         """
@@ -365,9 +378,11 @@ class SimEnv(gym.Env):
         return matrix
 
     def find_empty_cell(
-        self, matrix, fix_axes=[None, None, None]
-    ) -> tuple[np.int64, np.int64, np.int64]:
+        self, matrix, fix_axes: Optional[Sequence[Optional[int]]] = None
+    ) -> tuple[int, int, int]:
         """Find an empty cell in the matrix"""
+        if fix_axes is None:
+            fix_axes = [None, None, None]
         for _ in range(_RANDOM_TRY_TIMEOUT):
             x = self.np_random.integers(
                 0,
@@ -433,7 +448,8 @@ class SimEnv(gym.Env):
         every reset()).
         """
         obj = self._construction_objects[0]
-        self._dist_to_object = self._bfs_distance_field((obj.pos[0], obj.pos[1]))
+        center = obj.center
+        self._dist_to_object = self._bfs_distance_field((center[0], center[1]))
         self._dist_to_target = self._bfs_distance_field(
             (obj.target_pos[0], obj.target_pos[1])
         )
@@ -538,7 +554,7 @@ class SimEnv(gym.Env):
         obj_pos = obj.pos.astype(np.float32)
         obj_target_pos = obj.target_pos.astype(np.float32)
 
-        dist_agent_to_obj = float(np.linalg.norm(agent_pos - obj_pos))
+        dist_agent_to_obj = float(np.linalg.norm(agent_pos - obj.center))
         dist_obj_to_target = float(np.linalg.norm(obj_pos - obj_target_pos))
         is_carrying = 1.0 if obj.is_carried else 0.0
 
@@ -550,7 +566,6 @@ class SimEnv(gym.Env):
         dir_to_obj_target = (
             diff_to_obj_target / norm if norm > 0 else np.zeros(3, dtype=np.float32)
         )
-        # TODO: fix calculation of distance to object to not use origin
         obs = np.concatenate(
             [
                 agent_pos,  # 0-2
@@ -619,7 +634,6 @@ class SimEnv(gym.Env):
         obj = self._construction_objects[0]
 
         collision = False
-        invalid_action = False
         reward = 0.0
         terminated = False
 
@@ -637,7 +651,8 @@ class SimEnv(gym.Env):
             new_pos = np.clip(self.agent.pos + movement, 0, self.matrix.shape).astype(
                 np.uint8
             )
-
+             #TODO implement better collision handling 
+             # (can step through object if speed is great enough, no check for that at the moment)
             if not self._is_position_valid(new_pos):
                 collision = True
                 self.agent.pos = old_pos
@@ -695,7 +710,7 @@ class SimEnv(gym.Env):
         # bump to cells that are directly adjacent rather than diagonally adjacent.
         agent_x, agent_y = int(self.agent.pos[0]), int(self.agent.pos[1])
         if self.phase == self.Phase.TO_OBJECT:
-            goal_x, goal_y = float(obj.pos[0]), float(obj.pos[1])
+            goal_x, goal_y = float(obj.center[0]), float(obj.center[1])
             bfs_dist = float(self._dist_to_object[agent_x, agent_y])
         else:
             goal_x, goal_y = float(obj.target_pos[0]), float(obj.target_pos[1])
@@ -710,9 +725,6 @@ class SimEnv(gym.Env):
 
         if collision:
             reward -= 10.0
-
-        if invalid_action:
-            reward -= 2.0
 
         reward -= 0.1
 
@@ -730,7 +742,6 @@ class SimEnv(gym.Env):
         observation = self._get_obs()
         info = self._get_info()
         info["collision"] = collision
-        info["invalid_action"] = invalid_action
         info["phase"] = self.phase
         info["is_carrying"] = obj.is_carried
 
@@ -766,16 +777,16 @@ class ContinuousSimEnv(SimEnv):
 
     def _is_path_clear(self, start: np.ndarray, end: np.ndarray) -> bool:
         """Samples the segment start->end to catch obstacles a single-point check would skip over."""
-        matrix = self.place_objects(self._construction_objects, self._obstacle_matrix)
         distance = float(np.hypot(end[0] - start[0], end[1] - start[1]))
         n_substeps = max(1, int(np.ceil(distance / 0.5)))
+        size_x, size_y = self.matrix.shape[0], self.matrix.shape[1]
         for i in range(1, n_substeps + 1):
             t = i / n_substeps
             x = start[0] + t * (end[0] - start[0])
             y = start[1] + t * (end[1] - start[1])
-            if x < 0 or y < 0 or x >= matrix.shape[0] or y >= matrix.shape[1]:
+            if x < 0 or y < 0 or x >= size_x or y >= size_y:
                 return False
-            if matrix[int(x), int(y), 0] != 0:
+            if self._is_cell_blocked(int(x), int(y), 0):
                 return False
         return True
 
@@ -844,7 +855,7 @@ class ContinuousSimEnv(SimEnv):
 
         agent_x, agent_y = float(self.agent.pos[0]), float(self.agent.pos[1])
         if self.phase == self.Phase.TO_OBJECT:
-            goal_x, goal_y = float(obj.pos[0]), float(obj.pos[1])
+            goal_x, goal_y = float(obj.center[0]), float(obj.center[1])
             bfs_dist = self._interpolate_field(self._dist_to_object, agent_x, agent_y)
         else:
             goal_x, goal_y = float(obj.target_pos[0]), float(obj.target_pos[1])
