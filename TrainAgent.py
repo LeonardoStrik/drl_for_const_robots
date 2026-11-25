@@ -1,29 +1,24 @@
 import gymnasium as gym
+import supersuit as ss
 from stable_baselines3 import DQN, PPO, SAC
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 from Env import make_env, make_continuous_env
+from MultiAgentEnv import make_multi_agent_env
 import os
 
 
 def train_dqn_pathfinding():
-    """
-    Train a DQN agent in the simulation environment
-    """
-
-    # Create directories for saving models and logs
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
     env = make_env()
     env = Monitor(env)
 
-    # Create evaluation environment
     eval_env = make_env()
     eval_env = Monitor(eval_env)
 
-    # Create callbacks
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path="./models/best_model",
@@ -40,7 +35,7 @@ def train_dqn_pathfinding():
         name_prefix="dqn_pathfinding",
     )
 
-    # Create the DQN agent TODO: Validate most of these values
+    # TODO: validate most of these values
     model = DQN(
         policy="MlpPolicy",
         env=env,
@@ -65,7 +60,6 @@ def train_dqn_pathfinding():
     print(f"Observation space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
 
-    # Train the agent
     model.learn(
         total_timesteps=500000,
         callback=[eval_callback, checkpoint_callback],
@@ -73,7 +67,6 @@ def train_dqn_pathfinding():
         progress_bar=True,
     )
 
-    # Save the final model
     model.save("models/dqn_pathfinding_final")
     print("Training complete! Model saved to 'models/dqn_pathfinding_final'")
 
@@ -81,22 +74,15 @@ def train_dqn_pathfinding():
 
 
 def train_ppo_pathfinding():
-    """
-    Train a PPO agent in the simulation environment
-    """
-
-    # Create directories for saving models and logs
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
     env = make_env()
     env = Monitor(env)
 
-    # Create evaluation environment
     eval_env = make_env()
     eval_env = Monitor(eval_env)
 
-    # Create callbacks
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path="./models/best_model",
@@ -130,7 +116,6 @@ def train_ppo_pathfinding():
     print(f"Observation space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
 
-    # Train the agent
     model.learn(
         total_timesteps=500000 * 2,
         callback=[eval_callback, checkpoint_callback],
@@ -138,7 +123,6 @@ def train_ppo_pathfinding():
         progress_bar=True,
     )
 
-    # Save the final model
     model.save("models/ppo_pathfinding_final")
     print("Training complete! Model saved to 'models/ppo_pathfinding_final'")
 
@@ -146,9 +130,7 @@ def train_ppo_pathfinding():
 
 
 def train_ppo_continuous():
-    """
-    Train a PPO agent with continuous [v, omega] actions on ContinuousSimEnv.
-    """
+    """PPO with continuous [v, omega] actions on ContinuousSimEnv."""
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -211,11 +193,7 @@ def train_ppo_continuous():
 
 
 def train_sac_continuous():
-    """
-    Train a SAC agent with continuous [v, omega] actions on ContinuousSimEnv.
-    SAC's actor squashes its output with tanh by construction, so it doesn't
-    need the use_sde/squash_output/target_kl workarounds the PPO variant did.
-    """
+    """SAC on ContinuousSimEnv."""
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -243,6 +221,8 @@ def train_sac_continuous():
         save_vecnormalize=True,
     )
 
+    # no use_sde/squash_output/target_kl (needed for PPO above): SAC's actor is
+    # tanh-squashed by construction, so action saturation isn't a concern here.
     model = SAC(
         policy="MlpPolicy",
         env=env,
@@ -277,11 +257,77 @@ def train_sac_continuous():
     return model
 
 
+def train_sac_multi_agent(n_agents: int = 3, total_timesteps: int = 1000000):
+    """SAC with one shared policy across a fleet of n agents"""
+
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+
+    def make_vec_env():
+        pz_env = make_multi_agent_env(n_agents)
+        vec_env = ss.pettingzoo_env_to_vec_env_v1(pz_env)
+        vec_env = ss.concat_vec_envs_v1(vec_env, 1, base_class="stable_baselines3")
+        return VecMonitor(vec_env)
+
+    env = make_vec_env()
+    eval_env = make_vec_env()
+
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path="./models/best_model_multi_agent",
+        log_path="./logs/",
+        eval_freq=5000,
+        deterministic=True,
+        render=False,
+        n_eval_episodes=10,
+    )
+
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000,
+        save_path="./models/checkpoints/",
+        name_prefix="sac_multi_agent",
+    )
+
+    model = SAC(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=3e-4,
+        buffer_size=200000,
+        learning_starts=5000,
+        batch_size=256,
+        tau=0.005,
+        gamma=0.99,
+        train_freq=1,
+        gradient_steps=1,
+        verbose=1,
+        tensorboard_log="./logs/tensorboard/",
+    )
+
+    print("Starting training...")
+    print(f"n_agents: {n_agents}")
+    print(f"Total timesteps: {total_timesteps}")
+    print(f"Observation space: {env.observation_space}")
+    print(f"Action space: {env.action_space}")
+
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[eval_callback, checkpoint_callback],
+        log_interval=1,
+        progress_bar=True,
+    )
+
+    model.save("models/sac_multi_agent_final")
+    print("Training complete! Model saved to 'models/sac_multi_agent_final'")
+
+    return model
+
+
 _TRAIN_FNS = {
     "dqn": train_dqn_pathfinding,
     "ppo": train_ppo_pathfinding,
     "ppo_continuous": train_ppo_continuous,
     "sac_continuous": train_sac_continuous,
+    "sac_multi_agent": train_sac_multi_agent,
 }
 
 

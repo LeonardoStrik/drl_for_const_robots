@@ -82,8 +82,7 @@ def plot_episode(
 
     ax.voxels(env._obstacle_matrix, facecolors=[0, 0, 0, 0.5], edgecolors=[1, 1, 1])
 
-    # ContinuousSimEnv positions are already cell-centered; the discrete env's
-    # integer grid positions still need the +0.5 offset to sit inside a cell.
+    # ContinuousSimEnv positions are already cell-centered; discrete grid positions need +0.5.
     agent_path = result["agent_trajectory"] if continuous else result["agent_trajectory"] + 0.5
     ax.plot3D(
         agent_path[:, 0],
